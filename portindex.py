@@ -4,16 +4,21 @@
 Two discovery modes, chosen with --mode or PORTINDEX_MODE (default: scan):
 
   scan    Read /proc for listening TCP ports, probe each one, and list
-          whatever answers HTTP. Sees everything: uvicorn started by hand,
-          systemd units, containers with published ports. Run it on the host
-          (inside a container it would only see that container).
+          whatever serves a web page: HTML at /, or an OpenAPI title (FastAPI
+          & co). Sees uvicorn started by hand, systemd units, containers with
+          published ports. Run it on the host (inside a container it would
+          only see that container).
 
   docker  Ask the Docker daemon for running containers and list their
           published ports plus any Traefik Host()/PathPrefix() routes found
-          in their labels. No probing. Names come from the `portindex.title`
+          in their labels. No probing, so bare APIs are only left out via
+          `portindex.hide`. Names come from the `portindex.title`
           label, else the compose service name, else the container name.
           Run it on the host (user in the `docker` group) or as a container
           with the socket mounted -- see compose.yaml.
+
+Both modes leave out ports bound to localhost only, which other machines can't
+reach, and system ports (below 1024, except 80).
 
 Settings, as a flag or an environment variable:
 
@@ -47,9 +52,16 @@ SKIP_PORTS = {22, 5432}     # known non-HTTP services: never list or probe
 PROBE_TIMEOUT = 1.0         # scan mode: seconds per port (probes run in parallel)
 
 # One row on the page. links = [(text, url), ...]
-Entry = namedtuple("Entry", "title links detail meta warn")
-LOCAL_ONLY = ("listens on localhost only &mdash; "
-              "the :port link won't work from other machines")
+Entry = namedtuple("Entry", "title links detail meta")
+
+
+def is_loopback(ip):
+    return ip == "::1" or ip.startswith(("127.", "::ffff:127."))
+
+
+def system_port(port):
+    """Whether port is reserved for system services (CUPS, ...), rather than web apps."""
+    return port < 1024 and port != 80
 
 
 # --------------------------------------------------------------------------
@@ -85,7 +97,7 @@ def socket_inodes():
 
 
 def listening_ports():
-    """{port: (bind_ip, cmdline)} for every TCP listener (v4 + v6, deduped)."""
+    """{port: cmdline} for TCP listeners other machines can reach (v4 + v6, deduped)."""
     inodes = socket_inodes()
     ports = {}
     for path in ("/proc/net/tcp", "/proc/net/tcp6"):
@@ -100,7 +112,8 @@ def listening_ports():
                 continue
             addr, port = cols[1].rsplit(":", 1)
             port = int(port, 16)
-            if port in ports:
+            # checked per listener: a port can be bound to loopback and a public address
+            if port in ports or is_loopback(_ip(addr)):
                 continue
             cmd = ""
             pid = inodes.get(int(cols[9]))
@@ -110,7 +123,7 @@ def listening_ports():
                         cmd = f.read().replace(b"\0", b" ").decode(errors="replace").strip()
                 except OSError:
                     pass
-            ports[port] = (_ip(addr), cmd)
+            ports[port] = cmd
     return ports
 
 
@@ -127,7 +140,10 @@ def fetch(url):
 
 
 def probe(port):
-    """(status, title) if something HTTP answers on port, else None."""
+    """(status, title) if port serves a page for people, else None.
+
+    Bare APIs (Elasticsearch, MinIO, ...) answer HTTP but have nothing to show at /.
+    """
     base = f"http://127.0.0.1:{port}"
     res = fetch(base + "/")
     if res is None:
@@ -145,12 +161,14 @@ def probe(port):
                 title = json.loads(o[2])["info"]["title"]
             except (ValueError, KeyError, TypeError):
                 pass
+    if not title and ("html" not in ctype or status == 404):
+        return None
     return status, title
 
 
 def scan_entries(host, cfg, my_port):
-    ports = {p: v for p, v in listening_ports().items()
-             if p != my_port and p not in SKIP_PORTS}
+    ports = {p: cmd for p, cmd in listening_ports().items()
+             if p != my_port and p not in SKIP_PORTS and not system_port(p)}
     with ThreadPoolExecutor(max_workers=32) as ex:
         results = list(ex.map(probe, ports))
     entries = []
@@ -158,10 +176,8 @@ def scan_entries(host, cfg, my_port):
         if res is None:
             continue
         status, title = res
-        ip, cmd = ports[port]
-        local = ip == "::1" or re.match(r"(::ffff:)?127\.", ip)
         entries.append(Entry(title, [(f":{port}", f"http://{host}:{port}/")],
-                             f"[{status}]", cmd, LOCAL_ONLY if local else ""))
+                             f"[{status}]", ports[port]))
     return entries
 
 
@@ -235,14 +251,14 @@ def docker_entries(host, cfg, my_port):
         published = [p for p in c.get("Ports", [])
                      if p.get("PublicPort") and p.get("Type") == "tcp"
                      and p["PublicPort"] not in SKIP_PORTS
-                     and p.get("PrivatePort") not in SKIP_PORTS]
+                     and p.get("PrivatePort") not in SKIP_PORTS
+                     and not system_port(p["PublicPort"])
+                     and not is_loopback(p.get("IP", ""))]
         for port in sorted({p["PublicPort"] for p in published}):
             links.append((f":{port}", f"http://{host}:{port}/"))
         if not links:
             continue                         # internal-only container: db, worker...
-        local = published and all(p.get("IP") in ("127.0.0.1", "::1") for p in published)
-        entries.append(Entry(title, links, c.get("Status", ""), c.get("Image", ""),
-                             LOCAL_ONLY if local else ""))
+        entries.append(Entry(title, links, c.get("Status", ""), c.get("Image", "")))
     return sorted(entries, key=lambda e: e.title.lower())
 
 
@@ -262,9 +278,8 @@ small{color:#777} .warn{color:#b00} h1 small{font-size:.5em;font-weight:normal}
 
 def row(e):
     links = "".join(f"<a href='{html.escape(u)}'>{html.escape(t)}</a>" for t, u in e.links)
-    warn = f" <span class=warn>{e.warn}</span>" if e.warn else ""
     return (f"<li>{links}<b>{html.escape(e.title)}</b> <small>{html.escape(e.detail)}</small>"
-            f"{warn}<br><code>{html.escape(e.meta)}</code></li>")
+            f"<br><code>{html.escape(e.meta)}</code></li>")
 
 
 class Handler(BaseHTTPRequestHandler):
