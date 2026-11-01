@@ -46,30 +46,12 @@ makes the page instant. Run it on the host
 
 ## Running it permanently (scan mode)
 
-From this folder, copy the script to where the service expects it:
+From this folder, copy the script and [`portindex.service`](portindex.service)
+into place, start the service, now and on every boot, and check that it's running:
 
 ```
 sudo install -D -m 755 portindex.py /opt/portindex/portindex.py
-```
-
-Save this as `/etc/systemd/system/portindex.service`:
-
-```ini
-[Unit]
-Description=index of HTTP servers on this host
-After=network.target
-
-[Service]
-ExecStart=/usr/bin/python3 /opt/portindex/portindex.py
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Then start it, now and on every boot, and check that it's running:
-
-```
+sudo install -D -m 644 portindex.service /etc/systemd/system/portindex.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now portindex
 systemctl status portindex
@@ -77,9 +59,14 @@ systemctl status portindex
 
 The service runs as root, so it can see the command line of every server.
 
-- **Another port:** if 8000 is taken, add `Environment=PORTINDEX_PORT=<port>` under
-  `[Service]`, then run `sudo systemctl daemon-reload` and
-  `sudo systemctl restart portindex`.
-- **Updating:** repeat the `install` command, then run
-  `sudo systemctl restart portindex`.
+- **Another port:** if 8000 is taken, run `sudo systemctl edit portindex`, add the
+  lines below, then run `sudo systemctl restart portindex`. This is kept separately
+  from the installed unit, so updating won't overwrite it.
+
+  ```ini
+  [Service]
+  Environment=PORTINDEX_PORT=<port>
+  ```
+- **Updating:** repeat the two `install` commands, then run
+  `sudo systemctl daemon-reload` and `sudo systemctl restart portindex`.
 - **Logs:** `journalctl -u portindex`

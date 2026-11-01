@@ -1,0 +1,10 @@
+[Unit]
+Description=index of HTTP servers on this host
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/portindex/portindex.py
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
