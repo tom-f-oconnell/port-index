@@ -1,0 +1,71 @@
+# Traefik routes each app by hostname; portindex (docker mode) lists them all.
+#
+#   docker compose up -d
+#   open http://tensor.lab/            <- the index (bare domain)
+#        http://kc.tensor.lab/         <- an app, no port to remember
+#
+# DNS: point *.tensor.lab and tensor.lab at this machine (one wildcard A record
+# on the lab DNS server, or entries in each client's /etc/hosts). If clients can
+# reach public DNS, zero-config names like kc.10.0.0.5.nip.io also work.
+# No DNS at all? Use the PathPrefix variant at the bottom.
+
+services:
+  traefik:
+    image: traefik:v3
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedByDefault=false   # only containers with traefik.enable=true
+      - --entryPoints.web.address=:80
+    ports:
+      - "80:80"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    restart: unless-stopped
+
+  portindex:
+    image: python:3.12-slim                 # no build step: the script is mounted in
+    command: python3 /portindex.py          # mode/port could also be flags here
+    environment:
+      PORTINDEX_MODE: docker
+      # PORTINDEX_PROXY_PORT: "8080"        # if Traefik's entrypoint isn't :80
+    volumes:
+      - ./portindex.py:/portindex.py:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.portindex.rule: Host(`tensor.lab`)
+      traefik.http.services.portindex.loadbalancer.server.port: "8000"
+      portindex.hide: "true"                # don't list the index itself
+    # ports: ["8000:8000"]                  # optional: reachable without Traefik too
+    restart: unless-stopped
+
+  # ---- your apps: one block each --------------------------------------------
+  kc-viewer:
+    image: kc-viewer                        # or build: ./kc-viewer
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.kc.rule: Host(`kc.tensor.lab`)
+      traefik.http.services.kc.loadbalancer.server.port: "8000"   # what uvicorn listens on INSIDE the container
+      portindex.title: "KC responses viewer"                      # optional; default is the service name
+    # ports: ["8001:8000"]                  # optional raw port; portindex lists it alongside the hostname
+    restart: unless-stopped
+
+  odor-panel:
+    image: odor-panel
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.odor.rule: Host(`odor.tensor.lab`)
+      traefik.http.services.odor.loadbalancer.server.port: "8000"
+    restart: unless-stopped
+
+  # Containers without traefik labels or published ports (databases, workers)
+  # are simply not listed. A published non-HTTP port (e.g. "5433:5432") is
+  # skipped via SKIP_PORTS in portindex.py, or add  portindex.hide: "true".
+
+  # ---- no-DNS alternative: route by path instead of hostname -----------------
+  # Replace an app's router labels with these. The app must be told its prefix
+  # so its own links and redirects work:  uvicorn app:app --root-path /kc
+  #
+  #   traefik.http.routers.kc.rule: Host(`tensor`) && PathPrefix(`/kc`)
+  #   traefik.http.routers.kc.middlewares: kc-strip
+  #   traefik.http.middlewares.kc-strip.stripPrefix.prefixes: /kc
