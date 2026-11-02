@@ -20,6 +20,10 @@ Two discovery modes, chosen with --mode or PORTINDEX_MODE (default: scan):
 Both modes leave out ports bound to localhost only, which other machines can't
 reach, and system ports (below 1024, except 80).
 
+Each entry shows a PID and start time. In scan mode, these are of the process
+listening on the port, which for a container's published port is docker-proxy. In
+docker mode, they are of the container's main process, with the PID as the host sees it.
+
 Settings, as a flag or an environment variable:
 
   --mode        PORTINDEX_MODE        scan | docker               [scan]
@@ -44,15 +48,21 @@ import socket
 import struct
 import urllib.error
 import urllib.request
-from collections import namedtuple
+from collections import defaultdict, namedtuple
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 SKIP_PORTS = {22, 5432}     # known non-HTTP services: never list or probe
 PROBE_TIMEOUT = 1.0         # scan mode: seconds per port (probes run in parallel)
 
-# One row on the page. links = [(text, url), ...]
-Entry = namedtuple("Entry", "title links detail meta")
+# These hand listening sockets on to the servers they start, so a server also holding
+# the socket is the one to report. dockerd does this via docker-proxy's -use-listen-fd.
+SOCKET_BROKERS = {b"systemd", b"dockerd"}
+
+# One row on the page. links = [(text, url), ...]; started is a datetime; pid and started
+# are None if unknown.
+Entry = namedtuple("Entry", "title links detail meta pid started")
 
 
 def is_loopback(ip):
@@ -68,6 +78,10 @@ def system_port(port):
 # scan mode: /proc + HTTP probes
 # --------------------------------------------------------------------------
 
+# The process behind a port. started is a datetime; pid and started are None if unknown.
+Proc = namedtuple("Proc", "pid started cmd")
+
+
 def _ip(hexaddr):
     """Decode the little-endian hex address column of /proc/net/tcp{,6}."""
     if len(hexaddr) == 8:
@@ -77,8 +91,8 @@ def _ip(hexaddr):
 
 
 def socket_inodes():
-    """{socket inode: pid} for every process whose fds we're allowed to read."""
-    inodes = {}
+    """{socket inode: {pid, ...}} for every process whose fds we're allowed to read."""
+    inodes = defaultdict(set)
     for pid in os.listdir("/proc"):
         if not pid.isdigit():
             continue
@@ -92,14 +106,54 @@ def socket_inodes():
             except OSError:
                 continue
             if link.startswith("socket:["):
-                inodes[int(link[8:-1])] = int(pid)
+                inodes[int(link[8:-1])].add(int(pid))
     return inodes
 
 
+def boot_time():
+    """Seconds since the epoch at boot, which process start times count from."""
+    with open("/proc/stat") as f:
+        return int(re.search(r"^btime (\d+)$", f.read(), re.M).group(1))
+
+
+def proc_stat(pid):
+    """(comm, start time in clock ticks since boot) from /proc/<pid>/stat."""
+    with open(f"/proc/{pid}/stat", "rb") as f:
+        stat = f.read()
+    # comm is in parens, and can itself contain spaces and parens
+    start, end = stat.index(b"("), stat.rindex(b")")
+    return stat[start + 1:end], int(stat[end + 1:].split()[19])
+
+
+def listener_process(pids, boot):
+    """Proc to report for a port held by pids, with unknown fields if there are none.
+
+    Forked workers share their parent's socket, so this is the oldest holder: the parent,
+    which is what was started by hand and is unaffected by workers restarting.
+    """
+    stats = {}
+    for pid in pids:
+        try:
+            stats[pid] = proc_stat(pid)
+        except OSError:                      # already exited
+            pass
+    if not stats:
+        return Proc(None, None, "")
+    pid = min(stats, key=lambda p: (stats[p][0] in SOCKET_BROKERS, stats[p][1], p))
+    secs = boot + stats[pid][1] / os.sysconf("SC_CLK_TCK")
+    cmd = ""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            cmd = f.read().replace(b"\0", b" ").decode(errors="replace").strip()
+    except OSError:
+        pass
+    return Proc(pid, datetime.fromtimestamp(secs, timezone.utc), cmd)
+
+
 def listening_ports():
-    """{port: cmdline} for TCP listeners other machines can reach (v4 + v6, deduped)."""
+    """{port: Proc} for TCP listeners other machines can reach (v4 + v6, deduped)."""
     inodes = socket_inodes()
-    ports = {}
+    holders = defaultdict(set)
     for path in ("/proc/net/tcp", "/proc/net/tcp6"):
         try:
             with open(path) as f:
@@ -113,18 +167,11 @@ def listening_ports():
             addr, port = cols[1].rsplit(":", 1)
             port = int(port, 16)
             # checked per listener: a port can be bound to loopback and a public address
-            if port in ports or is_loopback(_ip(addr)):
+            if is_loopback(_ip(addr)):
                 continue
-            cmd = ""
-            pid = inodes.get(int(cols[9]))
-            if pid:
-                try:
-                    with open(f"/proc/{pid}/cmdline", "rb") as f:
-                        cmd = f.read().replace(b"\0", b" ").decode(errors="replace").strip()
-                except OSError:
-                    pass
-            ports[port] = cmd
-    return ports
+            holders[port] |= inodes.get(int(cols[9]), set())
+    boot = boot_time()
+    return {port: listener_process(pids, boot) for port, pids in holders.items()}
 
 
 def fetch(url):
@@ -167,7 +214,7 @@ def probe(port):
 
 
 def scan_entries(host, cfg, my_port):
-    ports = {p: cmd for p, cmd in listening_ports().items()
+    ports = {p: proc for p, proc in listening_ports().items()
              if p != my_port and p not in SKIP_PORTS and not system_port(p)}
     with ThreadPoolExecutor(max_workers=32) as ex:
         results = list(ex.map(probe, ports))
@@ -176,8 +223,9 @@ def scan_entries(host, cfg, my_port):
         if res is None:
             continue
         status, title = res
+        proc = ports[port]
         entries.append(Entry(title, [(f":{port}", f"http://{host}:{port}/")],
-                             f"[{status}]", ports[port]))
+                             f"[{status}]", proc.cmd, proc.pid, proc.started))
     return entries
 
 
@@ -237,6 +285,11 @@ def traefik_urls(labels, proxy_port):
     return urls
 
 
+def docker_time(stamp):
+    """Parse a Docker timestamp, always UTC, like 2026-11-02T19:52:52.557054839Z."""
+    return datetime.strptime(stamp[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+
+
 def docker_entries(host, cfg, my_port):
     entries = []
     for c in docker_get(cfg.docker, "/containers/json"):
@@ -258,7 +311,13 @@ def docker_entries(host, cfg, my_port):
             links.append((f":{port}", f"http://{host}:{port}/"))
         if not links:
             continue                         # internal-only container: db, worker...
-        entries.append(Entry(title, links, c.get("Status", ""), c.get("Image", "")))
+        try:
+            state = docker_get(cfg.docker, f"/containers/{c['Id']}/json")["State"]
+        except RuntimeError:                 # removed since it was listed
+            continue
+        # Pid is 0 while the container is restarting
+        entries.append(Entry(title, links, c.get("Status", ""), c.get("Image", ""),
+                             state["Pid"] or None, docker_time(state["StartedAt"])))
     return sorted(entries, key=lambda e: e.title.lower())
 
 
@@ -278,7 +337,11 @@ small{color:#777} .warn{color:#b00} h1 small{font-size:.5em;font-weight:normal}
 
 def row(e):
     links = "".join(f"<a href='{html.escape(u)}'>{html.escape(t)}</a>" for t, u in e.links)
-    return (f"<li>{links}<b>{html.escape(e.title)}</b> <small>{html.escape(e.detail)}</small>"
+    pid = f"pid {e.pid}" if e.pid else "pid unknown"
+    started = (f"started {e.started.astimezone():%Y-%m-%d %H:%M %Z}" if e.started
+               else "start time unknown")
+    detail = " · ".join((e.detail, pid, started))
+    return (f"<li>{links}<b>{html.escape(e.title)}</b> <small>{html.escape(detail)}</small>"
             f"<br><code>{html.escape(e.meta)}</code></li>")
 
 

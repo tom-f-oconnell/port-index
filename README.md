@@ -21,18 +21,23 @@ Both modes leave out ports bound to localhost only, since other machines can't
 reach them, and system ports (below 1024, except 80), such as CUPS on 631.
 
 **scan mode** labels each entry with the page's `<title>` (or the `info.title`
-from `/openapi.json` for FastAPI-style apps) and the process command line. Run
-it as the same user as your servers (or root) to see command lines. Only web
-pages are listed: `/` must return HTML (other than a 404), or the app must have
-an OpenAPI title, so bare APIs like Elasticsearch or MinIO are left out.
-`SKIP_PORTS` excludes known non-HTTP services from probing.
+from `/openapi.json` for FastAPI-style apps), and the PID, start time and command
+line of the process listening on the port. If several processes share the port,
+such as forked workers, that's the oldest. A container's published port shows
+`docker-proxy` here, not the app in the container; use docker mode to see that.
+Run it as the same user as your servers (or root), or their PIDs, start times and
+command lines will be unknown. Only web pages are listed: `/` must return HTML
+(other than a 404), or the app must have an OpenAPI title, so bare APIs like
+Elasticsearch or MinIO are left out. `SKIP_PORTS` excludes known non-HTTP services
+from probing.
 
 **docker mode** names entries from the `portindex.title` label, else the compose
-service name, else the container name. Containers with no route and no
-published port (databases, workers) are not listed; `portindex.hide: "true"`
-hides anything else, including bare APIs, since nothing is probed. That also
-makes the page instant. Run it on the host
-(user in the `docker` group) or as a container with the socket mounted — see
+service name, else the container name, and shows the PID of the container's main
+process (as the host sees it) and when the container started. Containers with no
+route and no published port (databases, workers) are not listed;
+`portindex.hide: "true"` hides anything else, including bare APIs, since nothing
+is probed. That also makes the page fast. Run it on the host (user in the `docker`
+group) or as a container with the socket mounted — see
 [`compose.yaml`](compose.yaml) for a complete Traefik + port-index stack.
 
 ## Settings
@@ -57,7 +62,8 @@ sudo systemctl enable --now portindex
 systemctl status portindex
 ```
 
-The service runs as root, so it can see the command line of every server.
+The service runs as root, so it can see the PID, start time and command line of
+every server.
 
 - **Another port:** if 8000 is taken, run `sudo systemctl edit portindex`, add the
   lines below, then run `sudo systemctl restart portindex`. This is kept separately
