@@ -27,6 +27,7 @@ services:
     command: python3 /portindex.py          # mode/port could also be flags here
     environment:
       PORTINDEX_MODE: docker
+      PORTINDEX_GROUPS: "off"               # this one project holds unrelated apps
       # PORTINDEX_PROXY_PORT: "8080"        # if Traefik's entrypoint isn't :80
     volumes:
       - ./portindex.py:/portindex.py:ro

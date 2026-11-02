@@ -24,6 +24,12 @@ Each entry shows a PID and start time. In scan mode, these are of the process
 listening on the port, which for a container's published port is docker-proxy. In
 docker mode, they are of the container's main process, with the PID as the host sees it.
 
+Related servers are nested under a parent, behind an arrow that shows or hides them:
+containers in one compose project, ports of one container and, in scan mode, servers
+started by another listed server. A project's parent is the container labelled
+portindex.parent=true, else the only one with the project's name in its title, else a
+header with just that name. Scan mode can only group containers if it can reach Docker.
+
 Settings, as a flag or an environment variable:
 
   --mode        PORTINDEX_MODE        scan | docker               [scan]
@@ -31,9 +37,12 @@ Settings, as a flag or an environment variable:
   --docker      PORTINDEX_DOCKER      socket path or tcp://host:port
                                                  [/var/run/docker.sock]
   --proxy-port  PORTINDEX_PROXY_PORT  Traefik's HTTP port, for Host() links [80]
+  --groups      PORTINDEX_GROUPS      on | off: nest related servers [on]
 
 Container labels honoured in docker mode:
   portindex.title=<text>   name to show      portindex.hide=true   leave it out
+And in both modes:
+  portindex.parent=true    nest the rest of its compose project under it
 
 Standard library only; Linux only. Every request re-scans, so the page is
 always current.
@@ -61,8 +70,9 @@ PROBE_TIMEOUT = 1.0         # scan mode: seconds per port (probes run in paralle
 SOCKET_BROKERS = {b"systemd", b"dockerd"}
 
 # One row on the page. links = [(text, url), ...]; started is a datetime; pid and started
-# are None if unknown.
-Entry = namedtuple("Entry", "title links detail meta pid started")
+# are None if unknown. Entries sharing a group are related, and main marks one known to
+# be the parent of the rest.
+Entry = namedtuple("Entry", "title links detail meta pid started group main")
 
 
 def is_loopback(ip):
@@ -74,12 +84,54 @@ def system_port(port):
     return port < 1024 and port != 80
 
 
+def names_group(title, group):
+    """Whether title has the group's name as whole words, ignoring case and separators."""
+    words = re.findall(r"[a-z0-9]+", group.lower())
+    return bool(re.search(r"\b" + r"[\W_]*".join(words) + r"\b", title, re.I))
+
+
+def group_parent(group, members):
+    """Which member of a group to nest the others under, or None if none clearly is."""
+    if len(members) == 1:
+        return members[0]
+    marked = [e for e in members if e.main]
+    if marked:
+        return marked[0]
+    named = [e for e in members if names_group(e.title, group)]
+    return named[0] if len(named) == 1 else None
+
+
+def nest(entries, cfg):
+    """[(parent Entry, [child Entry, ...]), ...] from entries, in their order.
+
+    A group with no clear parent gets a header, which is an Entry with no links, in place
+    of its first member.
+    """
+    if cfg.groups == "off":
+        return [(e, []) for e in entries]
+    groups = defaultdict(list)
+    for e in entries:
+        groups[e.group].append(e)
+    rows = []
+    for group, members in groups.items():
+        parent = group_parent(group, members)
+        position = entries.index(parent or members[0])
+        children = [e for e in members if e is not parent]
+        rows.append((position,
+                     parent or Entry(group, [], "", "", None, None, group, False),
+                     children))
+    return [r[1:] for r in sorted(rows, key=lambda r: r[0])]
+
+
 # --------------------------------------------------------------------------
 # scan mode: /proc + HTTP probes
 # --------------------------------------------------------------------------
 
 # The process behind a port. started is a datetime; pid and started are None if unknown.
 Proc = namedtuple("Proc", "pid started cmd")
+
+# Parts of /proc/<pid>/stat. start is in clock ticks since boot.
+Stat = namedtuple("Stat", "comm ppid start")
 
 
 def _ip(hexaddr):
@@ -117,12 +169,13 @@ def boot_time():
 
 
 def proc_stat(pid):
-    """(comm, start time in clock ticks since boot) from /proc/<pid>/stat."""
+    """Stat of a process, from /proc/<pid>/stat."""
     with open(f"/proc/{pid}/stat", "rb") as f:
         stat = f.read()
     # comm is in parens, and can itself contain spaces and parens
     start, end = stat.index(b"("), stat.rindex(b")")
-    return stat[start + 1:end], int(stat[end + 1:].split()[19])
+    fields = stat[end + 1:].split()
+    return Stat(stat[start + 1:end], int(fields[1]), int(fields[19]))
 
 
 def listener_process(pids, boot):
@@ -139,8 +192,8 @@ def listener_process(pids, boot):
             pass
     if not stats:
         return Proc(None, None, "")
-    pid = min(stats, key=lambda p: (stats[p][0] in SOCKET_BROKERS, stats[p][1], p))
-    secs = boot + stats[pid][1] / os.sysconf("SC_CLK_TCK")
+    pid = min(stats, key=lambda p: (stats[p].comm in SOCKET_BROKERS, stats[p].start, p))
+    secs = boot + stats[pid].start / os.sysconf("SC_CLK_TCK")
     cmd = ""
     try:
         with open(f"/proc/{pid}/cmdline", "rb") as f:
@@ -172,6 +225,19 @@ def listening_ports():
             holders[port] |= inodes.get(int(cols[9]), set())
     boot = boot_time()
     return {port: listener_process(pids, boot) for port, pids in holders.items()}
+
+
+def top_listed_ancestor(pid, listed):
+    """The highest ancestor of pid in the set listed, or pid itself if there are none."""
+    top = pid
+    try:
+        while pid > 1:
+            pid = proc_stat(pid).ppid
+            if pid in listed:
+                top = pid
+    except OSError:                          # exited while walking up
+        pass
+    return top
 
 
 def fetch(url):
@@ -218,15 +284,23 @@ def scan_entries(host, cfg, my_port):
              if p != my_port and p not in SKIP_PORTS and not system_port(p)}
     with ThreadPoolExecutor(max_workers=32) as ex:
         results = list(ex.map(probe, ports))
+    listed = {port: res for port, res in sorted(zip(ports, results)) if res is not None}
+    pids = {ports[port].pid for port in listed}
+    containers = published_containers(cfg.docker)
+    roots = {}
     entries = []
-    for port, res in sorted(zip(ports, results)):
-        if res is None:
-            continue
-        status, title = res
+    for port, (status, title) in listed.items():
         proc = ports[port]
+        if port in containers:
+            group, main = docker_group(containers[port])
+        elif proc.pid:
+            root = top_listed_ancestor(proc.pid, pids)
+            group, main = roots.setdefault(root, f":{port}"), proc.pid == root
+        else:
+            group, main = f":{port}", False
         entries.append(Entry(title, [(f":{port}", f"http://{host}:{port}/")],
-                             f"[{status}]", proc.cmd, proc.pid, proc.started))
-    return entries
+                             f"[{status}]", proc.cmd, proc.pid, proc.started, group, main))
+    return nest(entries, cfg)
 
 
 # --------------------------------------------------------------------------
@@ -290,6 +364,23 @@ def docker_time(stamp):
     return datetime.strptime(stamp[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
 
 
+def docker_group(c):
+    """(group name, whether it's labelled as the group's parent) for a listed container."""
+    labels = c.get("Labels") or {}
+    return (labels.get("com.docker.compose.project") or c["Names"][0].lstrip("/"),
+            labels.get("portindex.parent") == "true")
+
+
+def published_containers(where):
+    """{published TCP port: listed container}, or {} if Docker can't be reached."""
+    try:
+        containers = docker_get(where, "/containers/json")
+    except (OSError, RuntimeError, ValueError, http.client.HTTPException):
+        return {}
+    return {p["PublicPort"]: c for c in containers for p in c.get("Ports", [])
+            if p.get("PublicPort") and p.get("Type") == "tcp"}
+
+
 def docker_entries(host, cfg, my_port):
     entries = []
     for c in docker_get(cfg.docker, "/containers/json"):
@@ -317,8 +408,10 @@ def docker_entries(host, cfg, my_port):
             continue
         # Pid is 0 while the container is restarting
         entries.append(Entry(title, links, c.get("Status", ""), c.get("Image", ""),
-                             state["Pid"] or None, docker_time(state["StartedAt"])))
-    return sorted(entries, key=lambda e: e.title.lower())
+                             state["Pid"] or None, docker_time(state["StartedAt"]),
+                             *docker_group(c)))
+    entries.sort(key=lambda e: e.title.lower())
+    return sorted(nest(entries, cfg), key=lambda r: r[0].title.lower())
 
 
 MODES = {"scan": scan_entries, "docker": docker_entries}
@@ -332,17 +425,50 @@ STYLE = """<style>
 body{font:15px/1.5 system-ui,sans-serif;max-width:60em;margin:2em auto;padding:0 1em}
 li{margin-bottom:.8em} a{font-size:1.2em;margin-right:.4em} code{color:#555;font-size:.85em}
 small{color:#777} .warn{color:#b00} h1 small{font-size:.5em;font-weight:normal}
+.group{list-style:none} summary{list-style:none} summary::-webkit-details-marker{display:none}
+details ul{margin-top:.8em;padding-left:1.5em}
+.arrow{display:inline-block;width:1.2em;margin-left:-1.2em;font-size:1.2em;cursor:pointer;user-select:none}
+.arrow::before{content:"▸"} details[open]>summary .arrow::before{content:"▾"}
 </style>"""
 
+# Each reload is a new page, so this remembers which groups are open. It also makes only
+# the arrow toggle, so text in the row can be selected. e.detail is 0 from the keyboard.
+SCRIPT = """<script>
+for (const d of document.querySelectorAll("details")) {
+  const key = "portindex.open." + d.dataset.group;
+  d.open = localStorage[key] === "1";
+  d.addEventListener("toggle", () => { localStorage[key] = d.open ? "1" : "0"; });
+  d.querySelector("summary").addEventListener("click", e => {
+    if (e.detail && !e.target.closest(".arrow, a")) e.preventDefault();
+  });
+}
+</script>"""
 
-def row(e):
+
+def row(e, related=0):
+    """The contents of an entry's list item, saying how many entries are nested under it."""
     links = "".join(f"<a href='{html.escape(u)}'>{html.escape(t)}</a>" for t, u in e.links)
-    pid = f"pid {e.pid}" if e.pid else "pid unknown"
-    started = (f"started {e.started.astimezone():%Y-%m-%d %H:%M %Z}" if e.started
-               else "start time unknown")
-    detail = " · ".join((e.detail, pid, started))
-    return (f"<li>{links}<b>{html.escape(e.title)}</b> <small>{html.escape(detail)}</small>"
-            f"<br><code>{html.escape(e.meta)}</code></li>")
+    parts = []
+    if e.links:                              # otherwise, a group header: not a server itself
+        parts.append(e.detail)
+        parts.append(f"pid {e.pid}" if e.pid else "pid unknown")
+        parts.append(f"started {e.started.astimezone():%Y-%m-%d %H:%M %Z}" if e.started
+                     else "start time unknown")
+    if related:
+        parts.append(f"{related} related server{'s' if related > 1 else ''}")
+    detail = html.escape(" · ".join(parts))
+    meta = f"<br><code>{html.escape(e.meta)}</code>" if e.meta else ""
+    return f"{links}<b>{html.escape(e.title)}</b> <small>{detail}</small>{meta}"
+
+
+def group_row(parent, children):
+    """A list item for a parent, with an arrow to show or hide any children."""
+    if not children:
+        return f"<li>{row(parent)}</li>"
+    nested = "\n".join(f"<li>{row(c)}</li>" for c in children)
+    return (f"<li class=group><details data-group='{html.escape(parent.group)}'>"
+            f"<summary><span class=arrow></span>{row(parent, len(children))}</summary>"
+            f"<ul>{nested}</ul></details></li>")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -354,15 +480,16 @@ class Handler(BaseHTTPRequestHandler):
         # link to whatever hostname the browser used to reach this page
         host = re.sub(r":\d+$", "", self.headers.get("Host", "localhost"))
         try:
-            entries = MODES[cfg.mode](host, cfg, self.server.server_address[1])
-            body = "\n".join(map(row, entries)) or "<li>no HTTP servers found</li>"
+            rows = MODES[cfg.mode](host, cfg, self.server.server_address[1])
+            body = ("\n".join(group_row(*r) for r in rows)
+                    or "<li>no HTTP servers found</li>")
         except Exception as e:
             body = (f"<li class=warn>{cfg.mode} mode failed: "
                     f"{html.escape(f'{type(e).__name__}: {e}')}</li>")
         h = html.escape(host)
         page = (f"<!doctype html><title>servers on {h}</title>{STYLE}"
                 f"<h1>HTTP servers on {h} <small>{cfg.mode} mode</small></h1>"
-                f"<ul>{body}</ul>").encode()
+                f"<ul>{body}</ul>{SCRIPT}").encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(page)))
@@ -384,6 +511,7 @@ def main():
     ap.add_argument("--docker", metavar="SOCK_OR_URL",
                     default=env("DOCKER", "/var/run/docker.sock"))
     ap.add_argument("--proxy-port", type=int, default=int(env("PROXY_PORT", 80)))
+    ap.add_argument("--groups", choices=["on", "off"], default=env("GROUPS", "on"))
     cfg = ap.parse_args()
 
     srv = ThreadingHTTPServer(("0.0.0.0", cfg.port), Handler)

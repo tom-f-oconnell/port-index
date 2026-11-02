@@ -40,6 +40,25 @@ is probed. That also makes the page fast. Run it on the host (user in the `docke
 group) or as a container with the socket mounted — see
 [`compose.yaml`](compose.yaml) for a complete Traefik + port-index stack.
 
+## Grouping
+
+Related servers are nested under a parent, and hidden behind an arrow until you
+open them. Your browser remembers which ones you left open.
+
+- **Containers in the same compose project**, or several ports of one container.
+  Scan mode asks Docker which ports belong to which container, so it needs access
+  to the socket for this (root, or the `docker` group). Containers using the host's
+  network aren't recognized in scan mode.
+- **Servers started by another listed server**, in scan mode. A process tree can't
+  group containers, since each one's parent is its own `containerd-shim`.
+
+A project's parent is the container labelled `portindex.parent: "true"`, else the
+only one with the project's name in its title. If there's no such container, the
+group gets a header with just the project's name. This is usual in docker mode,
+where titles are service names unless set with `portindex.title`.
+
+Use `--groups off` if a project holds unrelated apps, as in `compose.yaml`.
+
 ## Settings
 
 | Flag | Env var | Default |
@@ -48,6 +67,7 @@ group) or as a container with the socket mounted — see
 | `--port` | `PORTINDEX_PORT` | `8000` |
 | `--docker` | `PORTINDEX_DOCKER` | `/var/run/docker.sock` (or `tcp://host:2375`) |
 | `--proxy-port` | `PORTINDEX_PROXY_PORT` | `80` — Traefik's HTTP entrypoint, for `Host()` links |
+| `--groups` | `PORTINDEX_GROUPS` | `on` — nest related servers; `off` to list each separately |
 
 ## Running it permanently (scan mode)
 
